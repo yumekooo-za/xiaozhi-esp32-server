@@ -473,6 +473,107 @@ class ConnectionHandler:
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
+    # 添加TTS相关控制变量
+    tts_done_event = None
+    last_played_text_index = 0
+    
+    async def stream_tts(self, text, text_index):
+        """
+        流式TTS处理 - 直接处理音频流并发送给客户端
+        
+        参数:
+        - text: 待转换文本
+        - text_index: 文本段索引
+        
+        返回:
+        - 处理完成的事件，供调用者等待
+        """
+        if text is None or len(text) <= 0:
+            self.logger.bind(tag=TAG).info(f"无需tts转换，query为空: {text}")
+            return asyncio.Event()  # 返回一个已设置的事件
+            
+        self.logger.bind(tag=TAG).debug(f"开始流式TTS处理: {text}")
+        
+        # 创建一个事件来表示处理完成
+        done_event = asyncio.Event()
+        
+        # 发送情感分析消息
+        from core.handle.sendAudioHandle import analyze_emotion, emoji_map
+        emotion = analyze_emotion(text)
+        emoji = emoji_map.get(emotion, "🙂")  # 默认使用笑脸
+        await self.websocket.send(
+            json.dumps({
+                "type": "llm",
+                "text": emoji,
+                "emotion": emotion,
+                "session_id": self.session_id,
+            })
+        )
+        
+        # 发送TTS开始状态
+        from core.handle.sendAudioHandle import send_tts_message, sendAudio
+        await send_tts_message(self, "sentence_start", text)
+        
+        try:
+            # 新方法：直接使用现有的sendAudio逻辑，但通过集中收集opus帧的方式
+            all_opus_frames = []
+            
+            # 直接回调函数，收集所有opus帧
+            async def frame_collector_callback(opus_frame):
+                all_opus_frames.append(opus_frame)
+            
+            # 设置回调并等待TTS完成
+            self.logger.bind(tag=TAG).info(f"开始收集TTS音频帧: {text}")
+            await self.tts.text_to_speak_stream(text, frame_collector_callback)
+            self.logger.bind(tag=TAG).info(f"TTS音频帧收集完成，共 {len(all_opus_frames)} 帧")
+            
+            # 将opus帧保存到临时文件用于验证
+            if all_opus_frames:
+                debug_dir = "tmp/debug_tts"
+                os.makedirs(debug_dir, exist_ok=True)
+                
+                # 保存为原始PCM格式，方便验证
+                pcm_filename = f"{debug_dir}/tts_debug_{int(time.time())}_{text_index}.raw"
+                try:
+                    # 将Opus帧解码为PCM，并保存
+                    pcm_data = self.tts.decode_opus_frames(all_opus_frames)
+                    with open(pcm_filename, 'wb') as f:
+                        f.write(pcm_data)
+                    self.logger.bind(tag=TAG).info(
+                        f"已保存音频帧为原始PCM: {pcm_filename}，可使用ffplay -f s16le -ar 16000 -ac 1 {pcm_filename} 播放"
+                    )
+                except Exception as e:
+                    self.logger.bind(tag=TAG).error(f"保存音频失败: {e}")
+                
+                # 使用现成的sendAudio方法发送音频
+                await sendAudio(self, all_opus_frames)
+            
+            # 发送句子结束状态
+            await send_tts_message(self, "sentence_end", text)
+            
+            # 如果是最后一个文本段且LLM处理完成，发送停止消息
+            if self.llm_finish_task and text_index == self.tts_last_text_index:
+                await send_tts_message(self, "stop", None)
+                if self.close_after_chat:
+                    await self.close()
+            
+            # 标记处理完成
+            done_event.set()
+        
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"流式TTS处理出错: {e}")
+            # 确保发送结束消息，让客户端知道这段话结束了
+            await send_tts_message(self, "sentence_end", text)
+            # 即使出错也标记完成
+            done_event.set()
+        
+        return done_event
+    
+    async def _wait_for_tts_done(self, event):
+        """等待TTS处理完成"""
+        if event:
+            await event.wait()
+
     def chat(self, query):
 
         self.dialogue.put(Message(role="user", content=query))
@@ -523,15 +624,22 @@ class ConnectionHandler:
                 segment_text_raw = current_text[: last_punct_pos + 1]
                 segment_text = get_string_no_punctuation_or_emoji(segment_text_raw)
                 if segment_text:
-                    # 强制设置空字符，测试TTS出错返回语音的健壮性
-                    # if text_index % 2 == 0:
-                    #     segment_text = " "
                     text_index += 1
                     self.recode_first_last_text(segment_text, text_index)
-                    future = self.executor.submit(
-                        self.speak_and_play, segment_text, text_index
+                    
+                    # 使用流式TTS并等待处理完成
+                    tts_done_event = asyncio.run_coroutine_threadsafe(
+                        self.stream_tts(segment_text, text_index),
+                        self.loop
+                    ).result()
+                    
+                    # 等待这个音频处理和播放完成再继续
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._wait_for_tts_done(tts_done_event),
+                        self.loop
                     )
-                    self.tts_queue.put(future)
+                    future.result()  # 阻塞直到TTS完成
+                    
                     processed_chars += len(segment_text_raw)  # 更新已处理字符位置
 
         # 处理最后剩余的文本
@@ -542,11 +650,28 @@ class ConnectionHandler:
             if segment_text:
                 text_index += 1
                 self.recode_first_last_text(segment_text, text_index)
-                future = self.executor.submit(
-                    self.speak_and_play, segment_text, text_index
+                
+                # 使用流式TTS并等待处理完成
+                tts_done_event = asyncio.run_coroutine_threadsafe(
+                    self.stream_tts(segment_text, text_index),
+                    self.loop
+                ).result()
+                
+                # 等待最后一段音频处理完成
+                future = asyncio.run_coroutine_threadsafe(
+                    self._wait_for_tts_done(tts_done_event),
+                    self.loop
                 )
-                self.tts_queue.put(future)
+                future.result()  # 阻塞直到TTS完成
 
+        # 手动发送TTS停止消息，确保客户端知道所有音频已经播放完毕
+        from core.handle.sendAudioHandle import send_tts_message
+        asyncio.run_coroutine_threadsafe(
+            send_tts_message(self, "stop", None), 
+            self.loop
+        ).result()
+        self.logger.bind(tag=TAG).info("已发送TTS全部完成标记")
+        
         self.llm_finish_task = True
         self.dialogue.put(Message(role="assistant", content="".join(response_message)))
         self.logger.bind(tag=TAG).debug(
@@ -658,10 +783,18 @@ class ConnectionHandler:
                         if segment_text:
                             text_index += 1
                             self.recode_first_last_text(segment_text, text_index)
-                            future = self.executor.submit(
-                                self.speak_and_play, segment_text, text_index
+                            # 使用流式TTS并等待处理完成
+                            tts_done_event = asyncio.run_coroutine_threadsafe(
+                                self.stream_tts(segment_text, text_index),
+                                self.loop
+                            ).result()
+                            
+                            # 等待这个音频处理和播放完成再继续
+                            future = asyncio.run_coroutine_threadsafe(
+                                self._wait_for_tts_done(tts_done_event),
+                                self.loop
                             )
-                            self.tts_queue.put(future)
+                            future.result()  # 阻塞直到TTS完成
                             # 更新已处理字符位置
                             processed_chars += len(segment_text_raw)
 
@@ -717,16 +850,32 @@ class ConnectionHandler:
             if segment_text:
                 text_index += 1
                 self.recode_first_last_text(segment_text, text_index)
-                future = self.executor.submit(
-                    self.speak_and_play, segment_text, text_index
+                # 使用流式TTS并等待处理完成
+                tts_done_event = asyncio.run_coroutine_threadsafe(
+                    self.stream_tts(segment_text, text_index),
+                    self.loop
+                ).result()
+                
+                # 等待最后一段音频处理完成
+                future = asyncio.run_coroutine_threadsafe(
+                    self._wait_for_tts_done(tts_done_event),
+                    self.loop
                 )
-                self.tts_queue.put(future)
+                future.result()  # 阻塞直到TTS完成
 
         # 存储对话内容
         if len(response_message) > 0:
             self.dialogue.put(
                 Message(role="assistant", content="".join(response_message))
             )
+        
+        # 手动发送TTS停止消息，确保客户端知道所有音频已经播放完毕
+        from core.handle.sendAudioHandle import send_tts_message
+        asyncio.run_coroutine_threadsafe(
+            send_tts_message(self, "stop", None), 
+            self.loop
+        ).result()
+        self.logger.bind(tag=TAG).info("已发送TTS全部完成标记 (function_calling)")
 
         self.llm_finish_task = True
         self.logger.bind(tag=TAG).debug(

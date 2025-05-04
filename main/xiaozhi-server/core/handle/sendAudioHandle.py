@@ -64,33 +64,50 @@ async def sendAudioMessage(conn, audios, text, text_index=0):
             await conn.close()
 
 
+# 全局变量用于追踪音频播放
+currently_playing_audio = False
+audio_play_lock = asyncio.Lock()
+
 # 播放音频
 async def sendAudio(conn, audios):
-    # 流控参数优化
-    frame_duration = 60  # 帧时长（毫秒），匹配 Opus 编码
-    start_time = time.perf_counter()
-    play_position = 0
-
-    # 预缓冲：发送前 3 帧
-    pre_buffer = min(3, len(audios))
-    for i in range(pre_buffer):
-        await conn.websocket.send(audios[i])
-
-    # 正常播放剩余帧
-    for opus_packet in audios[pre_buffer:]:
-        if conn.client_abort:
-            return
-
-        # 计算预期发送时间
-        expected_time = start_time + (play_position / 1000)
-        current_time = time.perf_counter()
-        delay = expected_time - current_time
-        if delay > 0:
-            await asyncio.sleep(delay)
-
-        await conn.websocket.send(opus_packet)
-
-        play_position += frame_duration
+    global currently_playing_audio, audio_play_lock
+    
+    # 使用锁确保一次只播放一个音频片段
+    async with audio_play_lock:
+        logger.bind(tag=TAG).info(f"开始播放音频，长度: {len(audios)} 帧")
+        currently_playing_audio = True
+        
+        try:
+            # 流控参数优化
+            frame_duration = 60  # 帧时长（毫秒），匹配 Opus 编码
+            start_time = time.perf_counter()
+            play_position = 0
+    
+            # 预缓冲：发送前 3 帧
+            pre_buffer = min(3, len(audios))
+            for i in range(pre_buffer):
+                if conn.client_abort:
+                    return
+                await conn.websocket.send(audios[i])
+    
+            # 正常播放剩余帧
+            for opus_packet in audios[pre_buffer:]:
+                if conn.client_abort:
+                    return
+    
+                # 计算预期发送时间
+                expected_time = start_time + (play_position / 1000)
+                current_time = time.perf_counter()
+                delay = expected_time - current_time
+                if delay > 0:
+                    await asyncio.sleep(delay)
+    
+                await conn.websocket.send(opus_packet)
+                play_position += frame_duration
+                
+            logger.bind(tag=TAG).info(f"音频播放完成，总时长: {play_position}ms")
+        finally:
+            currently_playing_audio = False
 
 
 async def send_tts_message(conn, state, text=None):
