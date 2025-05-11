@@ -21,7 +21,7 @@ from core.utils.util import (
     initialize_modules,
 )
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from core.handle.sendAudioHandle import sendAudioMessage
+from core.handle.sendAudioHandle import sendAudioMessage, process_sentence_tts_stream, monitor_and_send_sentences, tts_stream_manager
 from core.handle.receiveAudioHandle import handleAudioMessage
 from core.handle.functionHandler import FunctionHandler
 from plugins_func.register import Action, ActionResponse
@@ -69,7 +69,7 @@ class ConnectionHandler:
         self.stop_event = threading.Event()
         self.tts_queue = queue.Queue()
         self.audio_play_queue = queue.Queue()
-        self.executor = ThreadPoolExecutor(max_workers=10)
+        self.executor = ThreadPoolExecutor(max_workers=20)
 
         # 依赖的组件
         self.vad = _vad
@@ -97,6 +97,7 @@ class ConnectionHandler:
         # tts相关变量
         self.tts_first_text_index = -1
         self.tts_last_text_index = -1
+        self.using_stream_queue = True  # 使用流式队列管理
 
         # iot相关变量
         self.iot_descriptors = {}
@@ -573,9 +574,153 @@ class ConnectionHandler:
         """等待TTS处理完成"""
         if event:
             await event.wait()
-
+    def run_async_in_thread(self,coro):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(coro)
+            return result
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"异步任务执行失败: {e}")
+            traceback.print_exc()
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+            
     def chat(self, query):
+        """使用流式句子队列处理聊天流程"""
+        # 根据配置选择使用旧版方法还是新版流式队列方法
+        if hasattr(self, "using_stream_queue") and self.using_stream_queue:
+            return self.stream_queue_chat(query)
+        else:
+            return self.legacy_chat(query)
 
+    def stream_queue_chat(self, query):
+        """使用流式句子队列处理聊天流程 (新版实现)"""
+        # 重置TTS流管理器
+        tts_stream_manager.reset()
+        tts_stream_manager.client_abort = self.client_abort
+        tts_stream_manager.session_id = self.session_id
+        
+        # 重置对话状态
+        self.dialogue.put(Message(role="user", content=query))
+        response_message = []
+        processed_chars = 0  # 跟踪已处理的字符位置
+        
+        # 启动句子监控线程 - 异步监控队列并发送音频
+        # 提前启动监控线程，可以立即处理产生的TTS结果
+        # sender_task = asyncio.run_coroutine_threadsafe(
+        #     monitor_and_send_sentences(self),
+        #     self.loop
+        # )
+        sender_task = self.executor.submit(
+            self.run_async_in_thread,
+            monitor_and_send_sentences(self)
+        )
+        
+        try:
+            # 使用带记忆的对话
+            future = asyncio.run_coroutine_threadsafe(
+                self.memory.query_memory(query), self.loop
+            )
+            memory_str = future.result()
+            
+            self.logger.bind(tag=TAG).debug(f"记忆内容: {memory_str}")
+            llm_responses = self.llm.response(
+                self.session_id, self.dialogue.get_llm_dialogue_with_memory(memory_str)
+            )
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
+            # 标记所有句子已处理完成
+            tts_stream_manager.set_all_completed()
+            return None
+            
+        self.llm_finish_task = False
+        text_index = 0
+        
+        for content in llm_responses:
+            response_message.append(content)
+            if self.client_abort:
+                tts_stream_manager.client_abort = True
+                break
+                
+            # 合并当前全部文本并处理未分割部分
+            full_text = "".join(response_message)
+            current_text = full_text[processed_chars:]  # 从未处理的位置开始
+            
+            # 查找最后一个有效标点
+            punctuations = ("。", ".", "？", "?", "！", "!", "；", ";", "：")
+            last_punct_pos = -1
+            number_flag = True
+            for punct in punctuations:
+                pos = current_text.rfind(punct)
+                prev_char = current_text[pos - 1] if pos - 1 >= 0 else ""
+                # 如果.前面是数字统一判断为小数
+                if prev_char.isdigit() and punct == ".":
+                    number_flag = False
+                if pos > last_punct_pos and number_flag:
+                    last_punct_pos = pos
+                    
+            # 找到分割点则处理
+            if last_punct_pos != -1:
+                segment_text_raw = current_text[: last_punct_pos + 1]
+                segment_text = get_string_no_punctuation_or_emoji(segment_text_raw)
+                if segment_text:
+                    text_index += 1
+                    self.recode_first_last_text(segment_text, text_index)
+                    
+                    # 流式TTS处理 - 异步启动，无需等待完成
+                    # asyncio.run_coroutine_threadsafe(
+                    #     process_sentence_tts_stream(self, segment_text, text_index),
+                    #     self.loop
+                    # )
+                    self.executor.submit(
+                        self.run_async_in_thread,
+                        process_sentence_tts_stream(self, segment_text, text_index)
+                    )
+                    
+                    processed_chars += len(segment_text_raw)  # 更新已处理字符位置
+                    
+        # 处理最后剩余的文本
+        full_text = "".join(response_message)
+        remaining_text = full_text[processed_chars:]
+        if remaining_text:
+            segment_text = get_string_no_punctuation_or_emoji(remaining_text)
+            if segment_text:
+                text_index += 1
+                self.recode_first_last_text(segment_text, text_index)
+                
+                # 流式TTS处理最后一段文本 - 异步启动
+                self.executor.submit(
+                    self.run_async_in_thread,
+                    process_sentence_tts_stream(self, segment_text, text_index)
+                )
+                
+        # 标记所有句子已处理完成
+        tts_stream_manager.set_all_completed()
+        
+        # 等待句子监控任务完成
+        try:
+            sender_task.result(timeout=60)  # 设置合理的超时时间
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"句子监控任务异常: {e}")
+            # 在任务异常的情况下手动发送停止信号
+            from core.handle.sendAudioHandle import send_tts_message
+            asyncio.run_coroutine_threadsafe(
+                send_tts_message(self, "stop", None),
+                self.loop
+            ).result()
+            self.logger.bind(tag=TAG).info("句子监控任务异常，手动发送TTS停止信号")
+            
+        self.llm_finish_task = True
+        self.dialogue.put(Message(role="assistant", content="".join(response_message)))
+        self.logger.bind(tag=TAG).debug(
+            json.dumps(self.dialogue.get_llm_dialogue(), indent=4, ensure_ascii=False)
+        )
+        return True
+        
+    def legacy_chat(self, query):
+        """处理聊天流程 (旧版实现)"""
         self.dialogue.put(Message(role="user", content=query))
 
         response_message = []
@@ -680,16 +825,36 @@ class ConnectionHandler:
         return True
 
     def chat_with_function_calling(self, query, tool_call=False):
-        self.logger.bind(tag=TAG).debug(f"Chat with function calling start: {query}")
-        """Chat with function calling for intent detection using streaming"""
-
+        """使用函数调用处理聊天流程"""
+        # 根据配置选择使用旧版方法还是新版流式队列方法
+        if hasattr(self, "using_stream_queue") and self.using_stream_queue:
+            return self.stream_queue_function_calling(query, tool_call)
+        else:
+            return self.legacy_function_calling(query, tool_call)
+            
+    def stream_queue_function_calling(self, query, tool_call=False):
+        """使用流式句子队列处理函数调用聊天流程 (新版实现)"""
+        self.logger.bind(tag=TAG).debug(f"Function calling with stream queue: {query}")
+        
+        # 重置TTS流管理器
+        tts_stream_manager.reset()
+        tts_stream_manager.client_abort = self.client_abort
+        tts_stream_manager.session_id = self.session_id
+        
+        # 启动句子监控线程 - 异步监控队列并发送音频
+        sender_task = asyncio.run_coroutine_threadsafe(
+            monitor_and_send_sentences(self),
+            self.loop
+        )
+        
         if not tool_call:
             self.dialogue.put(Message(role="user", content=query))
-
-        # Define intent functions
+            
+        # 获取函数定义
         functions = None
         if hasattr(self, "func_handler"):
             functions = self.func_handler.get_functions()
+            
         response_message = []
         processed_chars = 0  # 跟踪已处理的字符位置
 
@@ -751,10 +916,218 @@ class ConnectionHandler:
                     response_message.append(content)
 
                     if self.client_abort:
+                        tts_stream_manager.client_abort = True
+                        break
+
+                    # 处理文本分段和TTS逻辑
+                    # 合并当前全部文本并处理未分割部分
+                    full_text = "".join(response_message)
+                    current_text = full_text[processed_chars:]  # 从未处理的位置开始
+
+                    # 查找最后一个有效标点
+                    punctuations = ("。", ".", "？", "?", "！", "!", "；", ";", "：")
+                    last_punct_pos = -1
+                    number_flag = True
+                    for punct in punctuations:
+                        pos = current_text.rfind(punct)
+                        prev_char = current_text[pos - 1] if pos - 1 >= 0 else ""
+                        # 如果.前面是数字统一判断为小数
+                        if prev_char.isdigit() and punct == ".":
+                            number_flag = False
+                        if pos > last_punct_pos and number_flag:
+                            last_punct_pos = pos
+
+                    # 找到分割点则处理
+                    if last_punct_pos != -1:
+                        segment_text_raw = current_text[: last_punct_pos + 1]
+                        segment_text = get_string_no_punctuation_or_emoji(
+                            segment_text_raw
+                        )
+                        if segment_text:
+                            text_index += 1
+                            self.recode_first_last_text(segment_text, text_index)
+                            
+                            # 流式TTS处理 - 异步启动，无需等待完成
+                            # asyncio.run_coroutine_threadsafe(
+                            #     process_sentence_tts_stream(self, segment_text, text_index),
+                            #     self.loop
+                            # )
+                            self.executor.submit(
+                                self.run_async_in_thread,
+                                process_sentence_tts_stream(self, segment_text, text_index)
+                            )
+
+                            self.logger.bind(tag=TAG).debug(f"开始tts合成，text_index: {text_index},文本：{segment_text}")
+                            
+                            # 更新已处理字符位置
+                            processed_chars += len(segment_text_raw)
+
+        # 处理function call
+        if tool_call_flag:
+            bHasError = False
+            if function_id is None:
+                a = extract_json_from_string(content_arguments)
+                if a is not None:
+                    try:
+                        content_arguments_json = json.loads(a)
+                        function_name = content_arguments_json["name"]
+                        function_arguments = json.dumps(
+                            content_arguments_json["arguments"], ensure_ascii=False
+                        )
+                        function_id = str(uuid.uuid4().hex)
+                    except Exception as e:
+                        bHasError = True
+                        response_message.append(a)
+                else:
+                    bHasError = True
+                    response_message.append(content_arguments)
+                if bHasError:
+                    self.logger.bind(tag=TAG).error(
+                        f"function call error: {content_arguments}"
+                    )
+            if not bHasError:
+                response_message.clear()
+                self.logger.bind(tag=TAG).debug(
+                    f"function_name={function_name}, function_id={function_id}, function_arguments={function_arguments}"
+                )
+                function_call_data = {
+                    "name": function_name,
+                    "id": function_id,
+                    "arguments": function_arguments,
+                }
+
+                # 处理MCP工具调用
+                if self.mcp_manager.is_mcp_tool(function_name):
+                    result = self._handle_mcp_tool_call(function_call_data)
+                else:
+                    # 处理系统函数
+                    result = self.func_handler.handle_llm_function_call(
+                        self, function_call_data
+                    )
+                self._handle_function_result(result, function_call_data, text_index + 1)
+
+        # 处理最后剩余的文本
+        full_text = "".join(response_message)
+        remaining_text = full_text[processed_chars:]
+        if remaining_text:
+            segment_text = get_string_no_punctuation_or_emoji(remaining_text)
+            if segment_text:
+                text_index += 1
+                self.recode_first_last_text(segment_text, text_index)
+                
+                # 流式TTS处理最后一段文本 - 异步启动
+                # asyncio.run_coroutine_threadsafe(
+                #     process_sentence_tts_stream(self, segment_text, text_index),
+                #     self.loop
+                # )
+                self.executor.submit(
+                        self.run_async_in_thread,
+                        process_sentence_tts_stream(self, segment_text, text_index)
+                    )
+
+                self.logger.bind(tag=TAG).debug(f"开始最后一段文本tts合成，text_index: {text_index},文本：{segment_text}")
+                
+        # 存储对话内容
+        if len(response_message) > 0:
+            self.dialogue.put(
+                Message(role="assistant", content="".join(response_message))
+            )
+        
+        # 标记所有句子已处理完成
+        tts_stream_manager.set_all_completed()
+        
+        # 等待句子监控任务完成
+        try:
+            sender_task.result(timeout=60)  # 设置合理的超时时间
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"句子监控任务异常: {e}")
+            # 在任务异常的情况下手动发送停止信号
+            from core.handle.sendAudioHandle import send_tts_message
+            asyncio.run_coroutine_threadsafe(
+                send_tts_message(self, "stop", None),
+                self.loop
+            ).result()
+            self.logger.bind(tag=TAG).info("句子监控任务异常，手动发送TTS停止信号")
+
+        self.llm_finish_task = True
+        self.logger.bind(tag=TAG).debug(
+            json.dumps(self.dialogue.get_llm_dialogue(), indent=4, ensure_ascii=False)
+        )
+
+        return True
+        
+    def legacy_function_calling(self, query, tool_call=False):
+        """旧版函数调用聊天流程实现"""
+        self.logger.bind(tag=TAG).debug(f"Legacy function calling chat: {query}")
+        
+        if not tool_call:
+            self.dialogue.put(Message(role="user", content=query))
+
+        # Define intent functions
+        functions = None
+        if hasattr(self, "func_handler"):
+            functions = self.func_handler.get_functions()
+        response_message = []
+        processed_chars = 0  # 跟踪已处理的字符位置
+
+        try:
+            start_time = time.time()
+
+            # 使用带记忆的对话
+            future = asyncio.run_coroutine_threadsafe(
+                self.memory.query_memory(query), self.loop
+            )
+            memory_str = future.result()
+
+            # 使用支持functions的streaming接口
+            llm_responses = self.llm.response_with_functions(
+                self.session_id,
+                self.dialogue.get_llm_dialogue_with_memory(memory_str),
+                functions=functions,
+            )
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
+            return None
+
+        self.llm_finish_task = False
+        text_index = 0
+
+        # 处理流式响应
+        tool_call_flag = False
+        function_name = None
+        function_id = None
+        function_arguments = ""
+        content_arguments = ""
+
+        for response in llm_responses:
+            content, tools_call = response
+
+            if "content" in response:
+                content = response["content"]
+                tools_call = None
+            if content is not None and len(content) > 0:
+                content_arguments += content
+
+            if not tool_call_flag and content_arguments.startswith("<tool_call>"):
+                tool_call_flag = True
+
+            if tools_call is not None:
+                tool_call_flag = True
+                if tools_call[0].id is not None:
+                    function_id = tools_call[0].id
+                if tools_call[0].function.name is not None:
+                    function_name = tools_call[0].function.name
+                if tools_call[0].function.arguments is not None:
+                    function_arguments += tools_call[0].function.arguments
+
+            if content is not None and len(content) > 0:
+                if not tool_call_flag:
+                    response_message.append(content)
+
+                    if self.client_abort:
                         break
 
                     end_time = time.time()
-                    # self.logger.bind(tag=TAG).debug(f"大模型返回时间: {end_time - start_time} 秒, 生成token={content}")
 
                     # 处理文本分段和TTS逻辑
                     # 合并当前全部文本并处理未分割部分

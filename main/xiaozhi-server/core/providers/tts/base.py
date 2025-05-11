@@ -5,6 +5,7 @@ import numpy as np
 import opuslib_next
 from pydub import AudioSegment
 from abc import ABC, abstractmethod
+from typing import Callable, List, Any
 from core.utils.tts import MarkdownCleaner
 
 TAG = __name__
@@ -52,6 +53,74 @@ class TTSProviderBase(ABC):
     @abstractmethod
     async def text_to_speak(self, text, output_file):
         pass
+        
+    async def text_to_speak_stream(self, text: str, frame_callback: Callable[[bytes], Any]) -> None:
+        """
+        流式生成TTS音频，并通过回调函数实时返回音频帧
+        
+        默认实现：使用非流式方法生成完整音频，然后模拟流式返回
+        子类可以覆盖此方法，提供真正的流式实现
+        
+        Args:
+            text: 要转换的文本
+            frame_callback: 回调函数，接收opus编码的音频帧
+        """
+        # 使用现有非流式方法生成临时文件
+        tmp_file = self.generate_filename()
+        try:
+            # 生成完整音频文件
+            await self.text_to_speak(text, tmp_file)
+            
+            if not os.path.exists(tmp_file):
+                raise FileNotFoundError(f"TTS文件生成失败: {tmp_file}")
+                
+            # 转换为Opus帧并逐一回调
+            opus_frames, _ = self.audio_to_opus_data(tmp_file)
+            for frame in opus_frames:
+                await frame_callback(frame)
+                # 模拟流式生成的延迟
+                await asyncio.sleep(0.01)
+                
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"流式TTS生成失败: {e}")
+            raise
+        finally:
+            # 清理临时文件
+            if self.delete_audio_file and os.path.exists(tmp_file):
+                os.remove(tmp_file)
+                
+    def decode_opus_frames(self, opus_frames: List[bytes]) -> bytes:
+        """
+        将Opus帧解码为PCM音频数据
+        
+        Args:
+            opus_frames: Opus编码的音频帧列表
+            
+        Returns:
+            解码后的PCM音频数据
+        """
+        # 初始化Opus解码器
+        decoder = opuslib_next.Decoder(16000, 1)
+        
+        # 每帧的PCM大小 (16kHz, 60ms帧, 16位采样)
+        frame_size = int(16000 * 60 / 1000)  # 960 samples/frame
+        pcm_size = frame_size * 2  # 16 bit = 2 bytes/sample
+        
+        # 收集所有解码的PCM数据
+        all_pcm = bytearray()
+        
+        # 逐帧解码
+        for frame in opus_frames:
+            try:
+                # 解码Opus帧
+                pcm_data = decoder.decode(frame, frame_size)
+                all_pcm.extend(pcm_data)
+            except Exception as e:
+                logger.bind(tag=TAG).error(f"Opus解码错误: {e}")
+                # 发生错误时，添加一帧静音
+                all_pcm.extend(b'\x00' * pcm_size)
+                
+        return bytes(all_pcm)
 
     def audio_to_opus_data(self, audio_file_path):
         """音频文件转换为Opus编码"""
