@@ -119,7 +119,7 @@ class TTSStreamManager:
         queue = self.get_sentence_queue(index)
         if queue:
             queue.add_frame(frame)
-            logger.bind(tag=TAG).warning(f"音频帧添加到句子队列，目前队列长度：{len(queue.audio_frames)}，句子索引: {index}")
+            logger.bind(tag=TAG).debug(f"音频帧添加到句子队列，目前队列长度：{len(queue.audio_frames)}，句子索引: {index}")
         else:
             logger.bind(tag=TAG).error(
                 f"尝试添加音频帧到不存在的句子队列: 索引={index}"

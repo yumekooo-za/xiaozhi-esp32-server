@@ -51,14 +51,14 @@ class TTSProvider(TTSProviderBase):
         """
 
         # 确保回调函数存在
-        if not self.stream_callback:
+        if not stream_callback:
             logger.bind(tag=TAG).error("未设置流式回调函数")
             return
 
         request_params = {}
         request_params["input"] = text
         request_params["response_format"] = self.format  # 直接请求PCM格式
-        
+
         # 确保启用流式参数
         if "stream" not in request_params and self.params.get("stream") is None:
             request_params["stream"] = True
