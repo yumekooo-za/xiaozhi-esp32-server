@@ -54,6 +54,9 @@ class SentenceAudioQueue:
     def get_all_frames(self) -> List[bytes]:
         """获取所有音频帧并清空队列"""
         with self.lock:
+            logger.bind(tag=TAG).debug(
+                f"获取所有音频帧: 队列大小={len(self.audio_frames)}"
+            )
             frames = self.audio_frames.copy()
             self.audio_frames.clear()
             return frames
@@ -116,7 +119,7 @@ class TTSStreamManager:
         queue = self.get_sentence_queue(index)
         if queue:
             queue.add_frame(frame)
-            # logger.bind(tag=TAG).warning(f"音频帧添加到句子队列，目前队列长度：{len(queue.audio_frames)}，句子索引: {index}")
+            logger.bind(tag=TAG).warning(f"音频帧添加到句子队列，目前队列长度：{len(queue.audio_frames)}，句子索引: {index}")
         else:
             logger.bind(tag=TAG).error(
                 f"尝试添加音频帧到不存在的句子队列: 索引={index}"
@@ -166,9 +169,7 @@ class TTSStreamManager:
             # 队列存在，检查是否有音频数据可发送
             if current_queue.has_frames():
                 # 获取队列中的所有音频帧
-                logger.bind(tag=TAG).debug(f"len(frames)={len(frames)}")
                 frames.extend(current_queue.get_all_frames())
-                logger.bind(tag=TAG).debug(f"len(frames) after extend={len(frames)}")
                 logger.bind(tag=TAG).debug(
                     f'获取句子音频帧: 索引={current_queue.index}, 文本="{current_queue.text}", 帧数={len(frames)}'
                 )
@@ -199,12 +200,18 @@ class TTSStreamManager:
                             f'文本="{current_queue.text}", 帧数={len(frames)}'
                         )
                         
+                        # 设置句子发送状态
                         if last_frame_time == 0:
-                            state=0
+                            if current_queue.is_TTS_completed():
+                                # 发送的时候已经完成所有tts音频合成
+                                state = "all_completed"
+                            else:
+                                state = "sentence_start"
                         elif current_queue.is_TTS_completed():
-                            state=2
+                            state = "sentence_end"
                         else:
-                            state=1
+                            state = "sentence_continue"
+                            
                         try:
                             await send_callback(
                                 current_queue.text,
@@ -217,17 +224,18 @@ class TTSStreamManager:
                         finally:
                             last_frame_time = current_time
                             frames.clear()
-            logger.bind(tag=TAG).info(f"索引={current_queue.index},处理完毕，当前剩余 {len(frames)} 帧，队列剩余{current_queue.frames_left()}帧")
+                            
             # 如果当前句子已完成TTS生成且没有更多音频帧，并且已标记为发送完毕，才转到下一个句子
             if (
                 current_queue.is_TTS_completed()
                 and not current_queue.has_frames()
                 and current_queue.is_sent_completed()
             ):
-                logger.bind(tag=TAG).debug(
+                logger.bind(tag=TAG).info(
                     f"---------------句子队列已处理并发送完毕: 索引={self.current_index}--------------"
                 )
                 self.current_index += 1
+                last_frame_time=0
                 logger.bind(tag=TAG).debug(f"开始处理索引={self.current_index}")
 
             else:
@@ -235,6 +243,7 @@ class TTSStreamManager:
                 await asyncio.sleep(0.02)
 
         logger.bind(tag=TAG).info("所有句子音频处理完成")
+        
 
     def _all_sentences_processed(self) -> bool:
         """检查是否所有句子队列都已处理完毕"""

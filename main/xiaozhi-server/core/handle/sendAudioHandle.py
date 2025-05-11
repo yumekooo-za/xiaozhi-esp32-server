@@ -166,7 +166,7 @@ async def process_sentence_tts_stream(conn, text: str, text_index: int):
 
         # 开始流式TTS生成
         logger.bind(tag=TAG).info(f"开始流式生成TTS: {text} (索引: {text_index})")
-        await conn.tts.text_to_speak_stream(text, frame_callback)
+        await conn.tts.text_to_speak_stream(text, text_index, frame_callback)
 
         # 不需要在此处发送音频，所有发送由monitor_and_send_sentences处理
 
@@ -201,7 +201,7 @@ async def monitor_and_send_sentences(conn):
     finally:
         # 处理完成后始终发送停止信号，无论llm_finish_task状态如何
         await send_tts_message(conn, "stop", None)
-        tts_stream_manager.reset()
+        # tts_stream_manager.reset()
         logger.bind(tag=TAG).info("所有句子处理完成，发送TTS停止信号")
         # 如果需要关闭连接则关闭
         if conn.close_after_chat:
@@ -232,42 +232,32 @@ async def _send_sentence_audio(
     )
 
     # 发送句子开始消息
-    if state == 0:
-        logger.bind(tag=TAG).info(f"发送给客户端开始句子标志: {text}")
+    if state == "sentence_start" or "all_completed":
+        logger.bind(tag=TAG).debug(f"发送给客户端开始句子标志: {text}")
         await send_tts_message(conn, "sentence_start", text)
 
     # 播放音频
     if audio_frames:
-        await sendAudio(conn, audio_frames, state==0)
+        logger.bind(tag=TAG).debug(
+            f"发送给客户端: {text}，共计{len(audio_frames)}帧音频"
+        )
+        await sendAudio(conn, audio_frames, state == 0)
+        logger.bind(tag=TAG).debug(
+            f"完成发送给客户端: {text}，共计{len(audio_frames)}帧音频"
+        )
 
     # 发送句子结束状态
-    if state == 2:
-        logger.bind(tag=TAG).info(f"发送给客户端结束句子标志: {text}")
+    if state == "sentence_end" or "all_completed":
+        logger.bind(tag=TAG).debug(f"发送给客户端结束句子标志: {text}")
         await send_tts_message(conn, "sentence_end", text)
-          # 标记该句子的音频已发送完成，允许处理下一个句子
+        
+        # 标记该句子的音频已发送完成，允许处理下一个句子
         sentence_queue = tts_stream_manager.get_sentence_queue(index)
         if sentence_queue:
             sentence_queue.mark_sent_completed()
-            logger.bind(tag=TAG).debug(f'标记句子音频发送完成: 索引={index}, 文本="{text}"')
-
-    # 调试信息：保存已发送的音频
-    # debug_dir = "tmp/debug_tts"
-    # if audio_frames and os.path.exists(debug_dir):
-    #     try:
-    #         # 将发送的Opus帧解码为PCM，并保存为调试文件
-    #         debug_file = f"{debug_dir}/sent_tts_{int(time.time())}_{index}.raw"
-    #         pcm_data = conn.tts.decode_opus_frames(audio_frames)
-    #         with open(debug_file, 'wb') as f:
-    #             f.write(pcm_data)
-    #         logger.bind(tag=TAG).debug(f"已保存发送的音频: {debug_file}")
-    #     except Exception as e:
-    #         logger.bind(tag=TAG).error(f"保存调试音频失败: {e}")
-
-    # # 标记该句子的音频已发送完成，允许处理下一个句子
-    # sentence_queue = tts_stream_manager.get_sentence_queue(index)
-    # if sentence_queue:
-    #     sentence_queue.mark_sent_completed()
-    #     logger.bind(tag=TAG).debug(f'标记句子音频发送完成: 索引={index}, 文本="{text}"')
+            logger.bind(tag=TAG).debug(
+                f'标记句子音频发送完成: 索引={index}, 文本="{text}"'
+            )
 
 
 async def send_tts_message(conn, state, text=None):
