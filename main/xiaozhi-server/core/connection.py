@@ -169,6 +169,14 @@ class ConnectionHandler:
 
             # 获取差异化配置
             private_config = self._initialize_private_config()
+            
+            # 异步初始化设备默认设置
+            from plugins_func.functions.connection_init import initialize_default_settings
+            self.executor.submit(
+                lambda: asyncio.run_coroutine_threadsafe(
+                    initialize_default_settings(self), self.loop
+                ).result()
+            )
             # 异步初始化
             self.executor.submit(self._initialize_components, private_config)
             # tts 消化线程
