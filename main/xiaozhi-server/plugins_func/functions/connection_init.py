@@ -23,7 +23,7 @@ async def initialize_default_settings(conn):
         
         # 设置默认音量为100
         if "Speaker" in conn.iot_descriptors:
-            logger.bind(tag=TAG).info("正在设置默认音量为100")
+            logger.bind(tag=TAG).info("正在设置默认音量为90")
             try:
                 volume = await _set_device_property(
                     conn,
@@ -31,7 +31,7 @@ async def initialize_default_settings(conn):
                     device_type="Speaker",
                     method_name="SetVolume",
                     property_name="volume",
-                    new_value=100,
+                    new_value=90,
                     action="set"
                 )
                 logger.bind(tag=TAG).info(f"默认音量已设置为: {volume}")
