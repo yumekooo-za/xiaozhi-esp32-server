@@ -8,12 +8,27 @@
    - WPS Office
    - 管理员权限
 
-2. **安装依赖**
+2. **使用虚拟环境（推荐）**
+   - Windows系统：
+     ```bash
+     # 直接运行启动脚本
+     start_server.bat
+     ```
+
+3. **手动安装依赖**
 ```bash
-pip install fastapi uvicorn websockets pywin32 psutil
+# 创建虚拟环境
+python -m venv venv
+
+# 激活虚拟环境
+# Windows:
+venv\Scripts\activate
+
+# 安装依赖
+pip install -r requirements.txt
 ```
 
-3. **启动服务**
+4. **启动服务**
 ```bash
 # 启动所有服务（HTTP + WebSocket）
 python server/server.py
