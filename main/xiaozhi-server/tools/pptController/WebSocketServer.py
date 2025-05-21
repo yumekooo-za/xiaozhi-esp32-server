@@ -73,6 +73,8 @@ class WebSocketServer:
             elif action == 'clearStyleHighlights':
                 slide = payload.get('slide')
                 response = await self.api.clearStyleHighlights(slide)
+            elif action == 'close':
+                response = await self.api.closePresentation()
             
             logger.info(f"处理命令: {action}, 结果: {response.message}")
             await websocket.send(json.dumps(asdict(response)))
