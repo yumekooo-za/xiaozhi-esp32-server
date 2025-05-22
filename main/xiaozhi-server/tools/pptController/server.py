@@ -98,6 +98,14 @@ async def runUnifiedServer(mode: str = 'both', http_port: int = 8000, ws_port: i
             server_instance = uvicorn.Server(config)
             tasks.append(asyncio.create_task(server_instance.serve()))
             
+            # 添加关闭检查任务
+            async def check_http_shutdown():
+                while not http_server.should_exit:
+                    await asyncio.sleep(1)
+                logger.info("检测到HTTP服务器关闭信号，正在关闭...")
+                server_instance.should_exit = True
+            tasks.append(asyncio.create_task(check_http_shutdown()))
+            
         if mode in ['ws', 'both']:
             controller = WPSPresentationController()
             api = PPTServerAPI(controller)
